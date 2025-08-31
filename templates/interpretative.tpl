@@ -1,26 +1,27 @@
 <!--
-  
+
   Copyright (C) 2025 Iheb Chagra
-  
+
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
-  
+
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   GNU General Public License for more details.
-  
+
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
-  
+
 -->
 
 % rebase('layout_big.tpl', title='Lecture interprétative')
 
 <h1>Lecture Interprétative : <i>{{isolat_name}}</i></h1>
-<a href="/prelevement/{{prelevement_id}}">&larr; Retour au prélèvement</a>
+<a href="/prelevement/{{prelevement_id}}">&larr; Retour au prélèvement</a><br>
+<a href="/prelevement/{{prelevement_id}}/isolat/{{isolat_id}}/brute">&larr; Retour à la lecture brute</a>
 <br><br>
 
 <fieldset>
@@ -219,6 +220,10 @@
 
   // Double clic pour monter rapidement
   tbody.addEventListener('dblclick', (e) => {
+    if (!e.target.closest('.drag-handle')) {
+      e.preventDefault();
+      return;
+    }
     const row = e.target.closest('tr');
     if (row) {
       selectRow(row);

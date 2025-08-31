@@ -27,6 +27,7 @@
     <fieldset>
     <label for="isolat_name">Nom de l'isolat</label>
     <select id="isolat_name" name="isolat_name" required>
+        <option value="">⤚ Sélectionnez une espèce ⤙</option>
         % for bacteria in bacteria_list:
         <option value="{{bacteria}}">{{bacteria}}</option>
         % end

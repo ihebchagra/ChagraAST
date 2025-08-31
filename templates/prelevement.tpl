@@ -53,13 +53,17 @@
     <legend><h2>Isolats</h2></legend>
     % for idx, isolat in enumerate(isolats):
     <details>
-        <summary>{{idx + 1}}. {{ isolat[1] }}</summary>
+        <summary>{{idx + 1}}. <i>{{ isolat[1] }}</i></summary>
         <form action="/prelevement/{{ prelevement[0] }}/isolat/{{ isolat[0] }}/brute">
           <button type="submit">Lecture brute</button>
         </form>
 
         <form action="/prelevement/{{ prelevement[0] }}/isolat/{{ isolat[0] }}/interpretative">
           <button type="submit" {{'disabled' if not isolat[2] else ''}}>Lecture interprétative</button>
+        </form>
+
+        <form action="/prelevement/{{ prelevement[0] }}/isolat/{{ isolat[0] }}/print">
+          <button type="submit" {{'disabled' if not isolat[2] else ''}}>Imprimer</button>
         </form>
 
         <form action="/prelevement/{{ prelevement[0] }}/delete_isolat/{{ isolat[0] }}" method="post" onsubmit="return confirm('Supprimer isolat n°{{idx + 1}} ({{ isolat[1] }}) ?');">

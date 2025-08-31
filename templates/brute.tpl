@@ -662,21 +662,6 @@ function setupCanvas(canvas, imageId, imgElement, antibiotics) {
 }
 </script>
 
-<script>
-/* --------------- Save scroll position on reload --------------- */
-window.addEventListener('beforeunload', function () {
-  sessionStorage.setItem('scrollY', String(window.scrollY || window.pageYOffset));
-});
-window.addEventListener('load', function () {
-  const y = parseInt(sessionStorage.getItem('scrollY') || '0', 10);
-  if (y) {
-    requestAnimationFrame(function restore() {
-      window.scrollTo(0, y);
-      sessionStorage.removeItem('scrollY');
-    });
-  }
-});
-</script>
 
 <script>
 /* --------------- update Antibiotiques supplémentaires --------------- */

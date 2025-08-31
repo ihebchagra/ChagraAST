@@ -34,3 +34,19 @@
     <footer><center>&copy 2025 - Iheb Chagra | <a href="/license">Licence GPLv3</a></center></footer>
 </body>
 </html>
+
+<script>
+/* --------------- Save scroll position on reload --------------- */
+window.addEventListener('beforeunload', function () {
+  sessionStorage.setItem('scrollY', String(window.scrollY || window.pageYOffset));
+});
+window.addEventListener('load', function () {
+  const y = parseInt(sessionStorage.getItem('scrollY') || '0', 10);
+  if (y) {
+    requestAnimationFrame(function restore() {
+      window.scrollTo(0, y);
+      sessionStorage.removeItem('scrollY');
+    });
+  }
+});
+</script>

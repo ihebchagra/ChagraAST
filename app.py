@@ -86,11 +86,11 @@ def nouveau_prelevement_submit(db, prelevement_id):
     repo.create_prelevement(
         db,
         prelevement_id,
-        f.get("matricule_patient"),
-        f.get("nom"),
-        f.get("prenom"),
-        f.get("service"),
-        f.get("type_prelevement"),
+        f.getunicode("matricule_patient"),
+        f.getunicode("nom"),
+        f.getunicode("prenom"),
+        f.getunicode("service"),
+        f.getunicode("type_prelevement"),
         f.get("date"),
     )
     redirect(f"/prelevement/{prelevement_id}")
@@ -118,11 +118,11 @@ def modifier_prelevement_post(prelevement_id, db):
     repo.update_prelevement(
         db,
         prelevement_id,
-        f.get("matricule_patient"),
-        f.get("nom"),
-        f.get("prenom"),
-        f.get("service"),
-        f.get("type_prelevement"),
+        f.getunicode("matricule_patient"),
+        f.getunicode("nom"),
+        f.getunicode("prenom"),
+        f.getunicode("service"),
+        f.getunicode("type_prelevement"),
         f.get("date"),
     )
     redirect(f"/prelevement/{prelevement_id}")
@@ -316,6 +316,7 @@ def print_interpretative(prelevement_id, isolat_id, db):
         return result
     lectures, commentaire, isolat_name = result
     prelevement = repo.get_prelevement(db, prelevement_id)
+    isolats = repo.list_isolats_with_status(db, prelevement_id)
     return template(
         "print.tpl",
         prelevement=prelevement,
@@ -323,7 +324,27 @@ def print_interpretative(prelevement_id, isolat_id, db):
         isolat_name=isolat_name,
         lectures=lectures,
         commentaire=commentaire,
-        datetime = datetime
+        datetime = datetime,
+        isolats = isolats
+    )
+
+
+@app.get("/prelevement/<prelevement_id>/isolat/<isolat_id:int>/print")
+def print_interpretative(prelevement_id, isolat_id, db):
+    lectures = repo.list_lectures(db, isolat_id)
+    commentaire = repo.get_commentaire(db, isolat_id)
+    isolat_name = repo.get_isolat_name(db, isolat_id)
+    prelevement = repo.get_prelevement(db, prelevement_id)
+    isolats = repo.list_isolats_with_status(db, prelevement_id)
+    return template(
+        "print.tpl",
+        prelevement=prelevement,
+        isolat_id=isolat_id,
+        isolat_name=isolat_name,
+        lectures=lectures,
+        commentaire=commentaire,
+        datetime = datetime,
+        isolats = isolats
     )
 
 @app.get("/license")
