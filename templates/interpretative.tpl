@@ -20,7 +20,7 @@
 % rebase('layout_big.tpl', title='Lecture interprétative')
 
 <h1>Lecture Interprétative : <i>{{isolat_name}}</i></h1>
-<a href="/prelevement/{{prelevement_id}}">&larr; Retour au prélèvement</a><br>
+<a href="/prelevement/{{prelevement_id}}">&larr; Retour au prélèvement</a><br><br>
 <a href="/prelevement/{{prelevement_id}}/isolat/{{isolat_id}}/brute">&larr; Retour à la lecture brute</a>
 <br><br>
 

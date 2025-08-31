@@ -176,7 +176,7 @@
       <th>Antibiotique</th>
       <th>Interprétation</th>
       % if any(lec[8] for lec in lectures if not bool(lec[6])):
-        <th>CMI</th>
+        <th>CMI (mg/l)</th>
       % end
     </tr>
   </thead>

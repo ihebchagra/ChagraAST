@@ -21,7 +21,7 @@
 
 <h1>Bienvenue sur ChagraAST</h1>
 <p>
-    ChagraAST est une application web complète pour la gestion et l'interprétation des antibiogrammes (ATB).
+    ChagraAST est une application complète pour la gestion et l'interprétation des antibiogrammes.
     Elle vise à simplifier et à standardiser le flux de travail du laboratoire, de l'enregistrement du prélèvement à la génération du rapport final.
 </p>
 
