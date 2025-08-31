@@ -1,0 +1,721 @@
+"""
+astimp.py
+
+Lightweight, pure-Python image analysis module to support process_image_plate.py.
+
+Implements an AST class that:
+  - Crops the Petri dish (attribute: crop)
+  - Detects antibiotic pellets (attribute: circles -> list of CircleData)
+  - Estimates pixels-per-millimeter scaling (attribute: px_per_mm)
+  - Measures inhibition diameters (attribute: inhibitions -> list of Inhibition)
+
+Designed to replace the previous external library while keeping the same interface
+used by process_image_plate.process_plate().
+
+ADDED (robustness improvements):
+  - Plausibility clamping to avoid unrealistically large diameters on low-contrast / noisy images.
+  - Neighbor-based maximum diameter gating (prevents halos extending unrealistically toward other disks).
+  - Plate-fraction maximum diameter gating.
+  - Contrast-based fallback: if zone contrast below threshold, falls back to pellet diameter.
+  - Quality (contrast) score stored per inhibition (new attribute Inhibition.quality).
+  - Configurable overshoot allowance (allows some tolerance before clamping).
+  - Safer handling when px_per_mm cannot be estimated.
+
+Dependencies:
+    pip install opencv-python numpy
+"""
+
+from __future__ import annotations
+import math
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Any, Dict
+
+import cv2
+import numpy as np
+
+
+# ------------------------------------------------------------------------------------------
+# Data Models
+# ------------------------------------------------------------------------------------------
+
+@dataclass
+class CircleData:
+    center: Tuple[int, int]
+    radius: int
+
+
+@dataclass
+class Inhibition:
+    diameter: float        # in millimeters
+    quality: float = 0.0   # contrast or reliability indicator (higher = better)
+
+
+# ------------------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------------------
+
+class Config:
+    # Dish extraction
+    MAX_DOWNSCALED_SIZE = 600
+    GRABCUT_BORDER_FRAC = 0.035
+    GRABCUT_ITERS = 5
+
+    # Pellet detection
+    PELLET_INTENSITY_PERCENT = 0.97
+    MAX_THINNESS = 1.08
+    PELLET_DIAM_MM = 6.0
+    MIN_PICTURE_TO_PELLET_RATIO = 35  # denominator for min pellet diameter
+    MAX_PICTURE_TO_PELLET_RATIO = 3   # denominator for max pellet diameter
+
+    # Inhibition measurement (original)
+    MAX_INHIB_DIAM_MM = 50.0
+    TARGET_PX_PER_MM = 10.0
+    MIN_PELLET_INTENSITY = 160
+    BORDER_PELLET_DISTANCE_MM = 2.0
+    MIN_LOCAL_CONTRAST = 15.0
+
+    # Robustness additions
+    PLATE_FRACTION_LIMIT = 0.80         # at most 80% of visible plate diameter
+    NEIGHBOR_CLEARANCE_FACTOR = 0.90    # fraction of free space toward nearest pellet
+    MAX_OVERSHOOT_MM = 5.0              # allowed overshoot over plausible max before clamp
+    MIN_PROFILE_CONTRAST = 20.0         # min (high-low) in profile (0..255 space) to accept larger zone
+    MIN_VALID_EXPANSION_FACTOR = 1.5    # if low contrast & measured > pellet*factor -> fallback
+    QUALITY_SCALE = 1.0                 # multiplier for quality score (contrast normalization)
+
+    # KMeans
+    KMEANS_ATTEMPTS = 8
+    KMEANS_MAX_ITER = 25
+
+    # Medium heuristic
+    BLOOD_SCORE_THRESHOLD = 0.5
+
+    # Fallback Hough
+    HOUGH_DP = 1.2
+    HOUGH_PARAM1 = 120
+    HOUGH_PARAM2 = 30
+
+
+CONFIG = Config()
+
+
+# ------------------------------------------------------------------------------------------
+# Utility
+# ------------------------------------------------------------------------------------------
+
+def _log(msg: str, verbose: bool):
+    if verbose:
+        print(msg)
+
+
+# ------------------------------------------------------------------------------------------
+# Medium Detection
+# ------------------------------------------------------------------------------------------
+
+def _calc_dominant_color(img: np.ndarray) -> Tuple[int, int, int]:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    hist = cv2.calcHist([s], [0], None, [256], [0, 256])
+    cum = np.cumsum(hist)
+    thresh = np.searchsorted(cum, cum[-1] * 0.5)
+    mask = (s > thresh).astype(np.uint8)
+    if mask.sum() == 0:
+        return (0, 0, 0)
+    h = int(round(cv2.mean(hsv[:, :, 0], mask=mask)[0]))
+    sat = int(round(cv2.mean(hsv[:, :, 1], mask=mask)[0]))
+    v = int(round(cv2.mean(hsv[:, :, 2], mask=mask)[0]))
+    return (h, sat, v)
+
+
+def _is_growth_medium_blood(img: np.ndarray) -> bool:
+    small = cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA)
+    h, s, v = _calc_dominant_color(small)
+    h_shifted = (h + 90) % 180 - 90
+    score = (-0.00067274 + 0.04034141 * s - 0.28679131 * v
+             - 0.17540224 * (h_shifted ** 2) + 0.00467521 * (s ** 2))
+    return score > CONFIG.BLOOD_SCORE_THRESHOLD
+
+
+# ------------------------------------------------------------------------------------------
+# Dish Extraction
+# ------------------------------------------------------------------------------------------
+
+def _grabcut_mask(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    border = int(CONFIG.GRABCUT_BORDER_FRAC * min(h, w))
+    rect = (border, border, w - 2 * border, h - 2 * border)
+    if rect[2] <= 0 or rect[3] <= 0:
+        raise RuntimeError("Invalid rectangle for grabCut.")
+    cv2.grabCut(img, mask, rect, bgd, fgd, CONFIG.GRABCUT_ITERS, cv2.GC_INIT_WITH_RECT)
+    binary = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+    return binary
+
+
+def _largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    return max(cnts, key=cv2.contourArea)
+
+
+def _get_petri_dish(original: np.ndarray, verbose: bool) -> np.ndarray:
+    h0, w0 = original.shape[:2]
+    scale = 1.0
+    max_dim = max(h0, w0)
+    if max_dim > CONFIG.MAX_DOWNSCALED_SIZE:
+        scale = CONFIG.MAX_DOWNSCALED_SIZE / max_dim
+    proc = cv2.resize(original, (int(w0 * scale), int(h0 * scale)),
+                      interpolation=cv2.INTER_AREA) if scale < 1.0 else original.copy()
+    _log(f"[Dish] Scale used: {scale:.3f}", verbose)
+    blur = cv2.GaussianBlur(proc, (5, 5), 0)
+    mask = _grabcut_mask(blur)
+    cnt = _largest_contour(mask)
+    if cnt is None or cv2.contourArea(cnt) < 0.05 * proc.shape[0] * proc.shape[1]:
+        raise RuntimeError("Dish contour not found.")
+    x, y, w, h = cv2.boundingRect(cnt)
+    if scale < 1.0:
+        x0 = int(round(x / scale)); y0 = int(round(y / scale))
+        w0c = int(round(w / scale)); h0c = int(round(h / scale))
+    else:
+        x0, y0, w0c, h0c = x, y, w, h
+    x1 = min(original.shape[1], x0 + w0c)
+    y1 = min(original.shape[0], y0 + h0c)
+    if (x1 - x0) < 50 or (y1 - y0) < 50:
+        raise RuntimeError("Dish crop too small.")
+    return original[y0:y1, x0:x1].copy()
+
+
+# ------------------------------------------------------------------------------------------
+# Pellet Detection
+# ------------------------------------------------------------------------------------------
+
+def _is_circle_outside(center: Tuple[int, int], r: int, shape: Tuple[int, int]) -> bool:
+    h, w = shape
+    x, y = center
+    return x - r < 0 or y - r < 0 or x + r >= w or y + r >= h
+
+
+def _thinness_ok(contour: np.ndarray, max_thinness: float) -> bool:
+    hull = cv2.convexHull(contour)
+    approx = cv2.approxPolyDP(hull, 1.0, True)
+    area = cv2.contourArea(approx)
+    perim = cv2.arcLength(approx, True)
+    if area <= 0 or perim <= 0:
+        return False
+    thinness = (perim ** 2) / (4 * math.pi * area)
+    return thinness <= max_thinness
+
+
+def _hough_fallback(gray: np.ndarray, min_r: int, max_r: int) -> List[CircleData]:
+    circles = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT, dp=CONFIG.HOUGH_DP,
+        minDist=min_r * 2,
+        param1=CONFIG.HOUGH_PARAM1,
+        param2=CONFIG.HOUGH_PARAM2,
+        minRadius=min_r,
+        maxRadius=max_r
+    )
+    res: List[CircleData] = []
+    if circles is not None:
+        for c in circles[0]:
+            x, y, r = int(round(c[0])), int(round(c[1])), int(round(c[2]))
+            res.append(CircleData(center=(x, y), radius=r))
+    return res
+
+
+def _find_pellets(img: np.ndarray, verbose: bool) -> List[CircleData]:
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    eq = cv2.equalizeHist(gray)
+    norm = cv2.normalize(eq, None, 0, 255, cv2.NORM_MINMAX)
+    thresh_val = int(255 * CONFIG.PELLET_INTENSITY_PERCENT)
+    _, fixed = cv2.threshold(norm, thresh_val, 255, cv2.THRESH_BINARY)
+    adapt = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY, 31, 2)
+    mask = cv2.bitwise_or(fixed, adapt)
+
+    min_d = min(img.shape[:2]) / CONFIG.MIN_PICTURE_TO_PELLET_RATIO
+    max_d = min(img.shape[:2]) / CONFIG.MAX_PICTURE_TO_PELLET_RATIO
+    min_d = max(min_d, 2)
+    se_size = max(1, int(round(min_d / 6)))
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, se, iterations=1)
+
+    cnts, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    found: List[CircleData] = []
+    for c in cnts:
+        (xf, yf), rf = cv2.minEnclosingCircle(c)
+        x, y, r = int(round(xf)), int(round(yf)), int(round(rf))
+        if r * 2 < min_d or r * 2 > max_d:
+            continue
+        if _is_circle_outside((x, y), r, gray.shape):
+            continue
+        if not _thinness_ok(c, CONFIG.MAX_THINNESS):
+            continue
+        found.append(CircleData(center=(x, y), radius=r))
+
+    if not found:
+        _log("[Pellets] Trying Hough fallback.", verbose)
+        found = _hough_fallback(gray, int(min_d / 2), int(max_d / 2))
+
+    # Deduplicate overlapping (keep larger)
+    found_sorted = sorted(found, key=lambda cd: cd.radius, reverse=True)
+    final: List[CircleData] = []
+    for cd in found_sorted:
+        keep = True
+        for existing in final:
+            dx = cd.center[0] - existing.center[0]
+            dy = cd.center[1] - existing.center[1]
+            dist = math.hypot(dx, dy)
+            if dist < min(cd.radius, existing.radius) * 0.6:
+                keep = False
+                break
+        if keep:
+            final.append(cd)
+    return final
+
+
+# ------------------------------------------------------------------------------------------
+# Scaling
+# ------------------------------------------------------------------------------------------
+
+def _mm_per_px(pellets: List[CircleData]) -> float:
+    if not pellets:
+        return 0.0
+    mean_r = float(np.mean([p.radius for p in pellets]))
+    if mean_r <= 0:
+        return 0.0
+    diam_px = mean_r * 2.0
+    return CONFIG.PELLET_DIAM_MM / diam_px
+
+
+# ------------------------------------------------------------------------------------------
+# KMeans & Profiles
+# ------------------------------------------------------------------------------------------
+
+def _masked_k_means(img: np.ndarray, k: int) -> List[float]:
+    flat = img.reshape(-1)
+    vals = flat[flat >= 0].astype(np.float32)
+    if vals.size < k:
+        return [0.0] * k
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                CONFIG.KMEANS_MAX_ITER, 1.0)
+    try:
+        _, _, centers = cv2.kmeans(vals.reshape(-1, 1), k, None, criteria,
+                                   CONFIG.KMEANS_ATTEMPTS, cv2.KMEANS_PP_CENTERS)
+        return sorted(float(c[0]) for c in centers)
+    except cv2.error:
+        med = float(np.median(vals)) if vals.size else 0.0
+        return [med] * k
+
+
+def _radial_profile(square_img: np.ndarray, mode: str,
+                    px_per_mm: float, th_value: float = 0) -> np.ndarray:
+    n = square_img.shape[0]
+    cx, cy = n // 2, n // 2
+    y_idx, x_idx = np.ogrid[:n, :n]
+    r_mat = np.round(np.sqrt((x_idx - cx) ** 2 + (y_idx - cy) ** 2)).astype(np.int32)
+    max_r = n // 2
+    prof = np.zeros(max_r + 1, dtype=np.float32)
+    for r in range(max_r + 1):
+        mask = (r_mat == r) & (square_img >= 0)
+        if not np.any(mask):
+            continue
+        v = square_img[mask]
+        if mode == 'MEAN':
+            prof[r] = np.mean(v)
+        elif mode == 'SWITCH':
+            prof[r] = np.sum(v > th_value)
+    if mode == 'SWITCH':
+        px_per_mm_int = max(1, int(round(px_per_mm)))
+        for i, val in enumerate(prof):
+            if i < px_per_mm_int or val > 2 * px_per_mm:
+                prof[i] = 1.0
+            elif val > px_per_mm:
+                prof[i] = val / (2 * px_per_mm)
+            else:
+                prof[i] = 0.0
+        prof *= 255.0
+    return prof
+
+
+def _calc_drs(global_kmc: List[float], local_kmc: List[float]) -> float:
+    if len(global_kmc) < 2 or len(local_kmc) < 2:
+        return 0.5
+    cl = local_kmc[1] - local_kmc[0]
+    cg = global_kmc[1] - global_kmc[0]
+    if cg == 0:
+        return 0.5
+    rel = (cg - cl) / cg
+    if rel >= 0.65 and (abs(local_kmc[1] - global_kmc[0]) > abs(local_kmc[1] - global_kmc[1])):
+        return 0.7
+    if cl <= CONFIG.MIN_LOCAL_CONTRAST:
+        return 0.05
+    return max(0.0, min(0.8, (rel ** 3 + 1) * 0.5))
+
+
+# ------------------------------------------------------------------------------------------
+# Inhibition Measurement Preparation
+# ------------------------------------------------------------------------------------------
+
+def _make_square(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    if h == w:
+        return img
+    size = max(h, w)
+    top = (size - h) // 2
+    bottom = size - h - top
+    left = (size - w) // 2
+    right = size - w - left
+    return cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=-1)
+
+
+def _prepare_inhibition_image(petri: np.ndarray,
+                              pellets: List[CircleData],
+                              medium_type: str,
+                              verbose: bool) -> Dict[str, Any]:
+    if medium_type == "blood":
+        b, g, r = cv2.split(petri)
+        merged = cv2.merge([b, g, g])
+        gray = cv2.cvtColor(merged, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = cv2.cvtColor(petri, cv2.COLOR_BGR2GRAY)
+
+    mm_per_px = _mm_per_px(pellets)
+    orig_px_per_mm = 1.0 / mm_per_px if mm_per_px > 0 else CONFIG.TARGET_PX_PER_MM
+
+    masked = gray.copy()
+    for c in pellets:
+        cv2.circle(masked, c.center, c.radius, (255,), -1)
+
+    centers = np.array([p.center for p in pellets], dtype=np.int32)
+    x, y, w, h = cv2.boundingRect(centers)
+    margin_px = int(round(CONFIG.BORDER_PELLET_DISTANCE_MM * orig_px_per_mm + max(p.radius for p in pellets)))
+    xs, ys = max(0, x - margin_px), max(0, y - margin_px)
+    xe = min(masked.shape[1], x + w + margin_px)
+    ye = min(masked.shape[0], y + h + margin_px)
+    crop = masked[ys:ye, xs:xe]
+
+    if orig_px_per_mm < CONFIG.TARGET_PX_PER_MM:
+        resize_f = CONFIG.TARGET_PX_PER_MM / orig_px_per_mm
+    else:
+        resize_f = 1.0
+    final_px_per_mm = orig_px_per_mm * resize_f
+
+    ksize = int(max(3, round(final_px_per_mm / 2)))
+    if ksize % 2 == 0:
+        ksize += 1
+    blur = cv2.medianBlur(crop, ksize)
+
+    float_img = blur.astype(np.float32) / 255.0
+    float_img[float_img >= (CONFIG.MIN_PELLET_INTENSITY / 255.0)] = -1.0
+
+    if resize_f != 1.0:
+        float_img = cv2.resize(float_img, None, fx=resize_f, fy=resize_f, interpolation=cv2.INTER_LINEAR)
+
+    pad = int(round((CONFIG.MAX_INHIB_DIAM_MM / 2.0) * final_px_per_mm))
+    padded = cv2.copyMakeBorder(float_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=-1)
+
+    remapped: List[CircleData] = []
+    for c in pellets:
+        nx = (c.center[0] - xs) * resize_f + pad
+        ny = (c.center[1] - ys) * resize_f + pad
+        remapped.append(CircleData(center=(int(round(nx)), int(round(ny))),
+                                   radius=int(round(c.radius * resize_f))))
+
+    km_global = _masked_k_means(padded * 255.0, 2)
+    max_r_px = int((CONFIG.MAX_INHIB_DIAM_MM / 2.0) * final_px_per_mm)
+
+    rois: List[Tuple[slice, slice]] = []
+    km_local: List[List[float]] = []
+    H, W = padded.shape
+    for c in remapped:
+        r = max_r_px
+        y0 = max(0, c.center[1] - r)
+        y1 = min(H, c.center[1] + r)
+        x0 = max(0, c.center[0] - r)
+        x1 = min(W, c.center[0] + r)
+        ss = (slice(y0, y1), slice(x0, x1))
+        rois.append(ss)
+        km_local.append(_masked_k_means(padded[ss] * 255.0, 2))
+
+    return {
+        "img": padded,
+        "rois": rois,
+        "pellets": remapped,
+        "px_per_mm": final_px_per_mm,
+        "km_centers": km_global,
+        "km_centers_local": km_local
+    }
+
+
+# ------------------------------------------------------------------------------------------
+# Plausibility Helpers
+# ------------------------------------------------------------------------------------------
+
+def _plate_fraction_limit(px_per_mm: float, crop_shape: Tuple[int, int]) -> float:
+    h, w = crop_shape
+    plate_diam_mm = min(h, w) / px_per_mm
+    return plate_diam_mm * CONFIG.PLATE_FRACTION_LIMIT
+
+
+def _neighbor_limit(idx: int, pellets: List[CircleData], px_per_mm: float) -> float:
+    """Return max diameter (mm) allowed by distance to neighbors (non-overlapping)."""
+    ci = pellets[idx]
+    limits = []
+    for j, cj in enumerate(pellets):
+        if j == idx:
+            continue
+        dx = ci.center[0] - cj.center[0]
+        dy = ci.center[1] - cj.center[1]
+        dist = math.hypot(dx, dy)
+        free_px = dist - ci.radius - cj.radius
+        if free_px <= 0:
+            continue
+        limits.append((free_px * 2) / px_per_mm)
+    if not limits:
+        return CONFIG.MAX_INHIB_DIAM_MM
+    return min(limits) * CONFIG.NEIGHBOR_CLEARANCE_FACTOR
+
+
+def _plausible_max(idx: int,
+                   pellets: List[CircleData],
+                   px_per_mm: float,
+                   crop_shape: Tuple[int, int]) -> float:
+    a = CONFIG.MAX_INHIB_DIAM_MM
+    b = _plate_fraction_limit(px_per_mm, crop_shape)
+    c = _neighbor_limit(idx, pellets, px_per_mm)
+    return max(0.0, min(a, b, c))
+
+
+# ------------------------------------------------------------------------------------------
+# Diameter Measurements (return value & contrast)
+# ------------------------------------------------------------------------------------------
+
+def _measure_inscribed(pre: Dict[str, Any], idx: int) -> Tuple[float, float]:
+    img = pre["img"]
+    roi = pre["rois"][idx]
+    ppm = pre["px_per_mm"]
+    pellet_r_px = int(CONFIG.PELLET_DIAM_MM * ppm / 2.0)
+    local_kmc = pre["km_centers_local"][idx]
+    global_kmc = pre["km_centers"]
+    if len(local_kmc) < 2 or len(global_kmc) < 2:
+        return -1.0, 0.0
+
+    if abs(local_kmc[1] - local_kmc[0]) >= CONFIG.MIN_LOCAL_CONTRAST or \
+            abs(global_kmc[1] - global_kmc[0]) <= CONFIG.MIN_LOCAL_CONTRAST:
+        kmc = local_kmc
+    else:
+        kmc = global_kmc
+
+    drs = _calc_drs(global_kmc, local_kmc)
+    th = (kmc[0] + (kmc[1] - kmc[0]) * (1 - drs)) / 255.0
+    square = _make_square(img[roi])
+    prof = _radial_profile(square, 'SWITCH', ppm, th)
+    if prof.size <= pellet_r_px:
+        return -1.0, 0.0
+    low_val = float(np.min(prof))
+    high_val = float(np.max(prof))
+    contrast = high_val - low_val
+    if contrast < 1e-6:
+        return CONFIG.PELLET_DIAM_MM, contrast
+
+    tail = prof[pellet_r_px:]
+    if np.all(tail == 0):
+        return CONFIG.MAX_INHIB_DIAM_MM, contrast
+
+    best_r = pellet_r_px
+    min_mse = float('inf')
+    rem = len(prof) - pellet_r_px
+    for offset in range(1, rem):
+        inhib_seg = prof[pellet_r_px: pellet_r_px + offset]
+        bact_seg = prof[pellet_r_px + offset:]
+        if inhib_seg.size == 0 or bact_seg.size == 0:
+            continue
+        mse = (np.sum((inhib_seg - low_val) ** 2) + np.sum((bact_seg - high_val) ** 2)) / rem
+        if mse < min_mse:
+            min_mse = mse
+            best_r = pellet_r_px + offset
+    diameter_mm = (best_r * 2) / ppm
+    return min(diameter_mm, CONFIG.MAX_INHIB_DIAM_MM), contrast
+
+
+def _measure_circumscribed(pre: Dict[str, Any], idx: int) -> Tuple[float, float]:
+    img = pre["img"]
+    roi = pre["rois"][idx]
+    ppm = pre["px_per_mm"]
+    pellet_r_px = int(CONFIG.PELLET_DIAM_MM * ppm / 2.0)
+    square = _make_square(img[roi])
+    prof = _radial_profile(square, 'MEAN', ppm)
+    if prof.size <= pellet_r_px:
+        return -1.0, 0.0
+    tail = prof[pellet_r_px:]
+    if tail.size == 0:
+        return -1.0, 0.0
+    mn, mx = float(np.min(tail)), float(np.max(tail))
+    contrast = mx - mn
+    if contrast < 1e-6:
+        return CONFIG.PELLET_DIAM_MM, contrast
+    thr = (mn + mx) / 2 * 1.1
+    bp = -1
+    for i, v in enumerate(tail):
+        if v > thr:
+            bp = i + pellet_r_px
+            break
+    if bp == -1:
+        return CONFIG.MAX_INHIB_DIAM_MM, contrast
+    diameter_mm = (bp * 2) / ppm
+    return min(diameter_mm, CONFIG.MAX_INHIB_DIAM_MM), contrast
+
+
+def _apply_plausibility(pellet_idx: int,
+                        raw_diam: float,
+                        contrast: float,
+                        pellets: List[CircleData],
+                        px_per_mm: float,
+                        crop_shape: Tuple[int, int]) -> Tuple[float, float]:
+    """Clamp / adjust diameter based on plausibility & contrast."""
+    if raw_diam <= 0 or px_per_mm <= 0:
+        return raw_diam, contrast
+
+    plausible_max = _plausible_max(pellet_idx, pellets, px_per_mm, crop_shape)
+    # Overshoot logic
+    if raw_diam > plausible_max + CONFIG.MAX_OVERSHOOT_MM:
+        raw_diam = plausible_max
+
+    # Low contrast: treat as 'no inhibition beyond pellet'
+    pellet_diam = CONFIG.PELLET_DIAM_MM
+    if contrast < CONFIG.MIN_PROFILE_CONTRAST and raw_diam > pellet_diam * CONFIG.MIN_VALID_EXPANSION_FACTOR:
+        raw_diam = pellet_diam
+
+    return raw_diam, contrast
+
+
+# ------------------------------------------------------------------------------------------
+# Aggregate Measurement
+# ------------------------------------------------------------------------------------------
+
+def _measure_all(petri: np.ndarray,
+                 pellets: List[CircleData],
+                 medium_type: str,
+                 mode: str,
+                 verbose: bool) -> List[Inhibition]:
+    if not pellets:
+        return []
+    pre = _prepare_inhibition_image(petri, pellets, medium_type, verbose)
+    ppm = pre["px_per_mm"]
+    inhibs: List[Inhibition] = []
+    for i in range(len(pellets)):
+        if mode == "circumscribed":
+            d, c = _measure_circumscribed(pre, i)
+        else:
+            d, c = _measure_inscribed(pre, i)
+        d_adj, c_adj = _apply_plausibility(i, d, c, pellets, ppm, petri.shape[:2])
+        inhibs.append(Inhibition(diameter=d_adj if d_adj > 0 else 0.0,
+                                 quality=c_adj * CONFIG.QUALITY_SCALE))
+    return inhibs
+
+
+# ------------------------------------------------------------------------------------------
+# Public AST Class
+# ------------------------------------------------------------------------------------------
+
+class AST:
+    """
+    Primary analysis class expected by process_image_plate.py
+
+    Attributes:
+        crop: np.ndarray -> cropped dish image
+        circles: List[CircleData]
+        inhibitions: List[Inhibition]
+        px_per_mm: Optional[float] (None if could not compute)
+    """
+
+    def __init__(self,
+                 img: np.ndarray,
+                 medium_type: str = "auto",
+                 measurement_mode: str = "inscribed",
+                 verbose: bool = False):
+        """
+        Parameters:
+            img : Original RGB or BGR image (numpy array).
+            medium_type : 'auto', 'standard', or 'blood'.
+            measurement_mode : 'inscribed' or 'circumscribed'.
+            verbose : If True, prints debug information.
+        """
+        self.original = img
+        self.crop: np.ndarray = img
+        self.circles: List[CircleData] = []
+        self.inhibitions: List[Inhibition] = []
+        self.px_per_mm: Optional[float] = None
+
+        try:
+            self.crop = _get_petri_dish(img, verbose)
+        except Exception as e:
+            _log(f"[AST] Dish extraction failed: {e}. Using original image.", verbose)
+            self.crop = img
+
+        # Detect pellets
+        try:
+            self.circles = _find_pellets(self.crop, verbose)
+        except Exception as e:
+            _log(f"[AST] Pellet detection failed: {e}", verbose)
+            self.circles = []
+
+        # Scaling
+        mm_per_px = _mm_per_px(self.circles)
+        self.px_per_mm = 1.0 / mm_per_px if mm_per_px > 0 else None
+
+        # Medium determination
+        if medium_type == "auto":
+            try:
+                medium = "blood" if _is_growth_medium_blood(self.crop) else "standard"
+            except Exception:
+                medium = "standard"
+        else:
+            medium = medium_type
+
+        # Inhibition measurements
+        try:
+            self.inhibitions = _measure_all(self.crop, self.circles, medium, measurement_mode, verbose)
+        except Exception as e:
+            _log(f"[AST] Inhibition measurement failed: {e}", verbose)
+            self.inhibitions = []
+
+
+# ------------------------------------------------------------------------------------------
+# (Optional) Quick Test Harness
+# ------------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python astimp.py <image_path> [output_debug.png]")
+        sys.exit(1)
+    path = sys.argv[1]
+    out = sys.argv[2] if len(sys.argv) > 2 else "astimp_debug.png"
+    img0 = cv2.imread(path)
+    if img0 is None:
+        print("Could not load image:", path)
+        sys.exit(2)
+    ast = AST(img0, medium_type="auto", measurement_mode="inscribed", verbose=True)
+    print(f"Pellets: {len(ast.circles)}")
+    print("Diameters (mm):", [f"{i.diameter:.1f}" for i in ast.inhibitions])
+    dbg = ast.crop.copy()
+    if dbg.ndim == 2:
+        dbg = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
+    for ci, c in enumerate(ast.circles):
+        cv2.circle(dbg, c.center, c.radius, (0, 255, 0), 2)
+        if ci < len(ast.inhibitions) and ast.inhibitions[ci].diameter > 0 and ast.px_per_mm:
+            inh_r_px = int(round((ast.inhibitions[ci].diameter / 2.0) * ast.px_per_mm))
+            cv2.circle(dbg, c.center, inh_r_px, (255, 0, 0), 2)
+            cv2.putText(dbg, f"{ast.inhibitions[ci].diameter:.1f}mm",
+                        (c.center[0] + 5, c.center[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    cv2.imwrite(out, dbg)
+    print("Saved debug image to", out)
+    print("Quality scores:", [f"{i.quality:.1f}" for i in ast.inhibitions])
